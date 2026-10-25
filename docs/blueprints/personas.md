@@ -201,6 +201,7 @@ Features that several personas need, ordered by how many ask for them:
 
 1. **Capture-on-tap mode** (parent, teacher, hero, fob users): `WIT_CAPTURE_ON_TAP`; `/capture`
    returns a frame only after a press; Wi-Fi modem sleep between; stream server compiled out.
+   *Done in firmware 1.1 and the plugin (`/capture?wait=`, `capture=on_tap`); bench measurements open.*
 2. **Streaming / off indicator on the device** (politician, engineer, teacher, hero): LED steady while
    a `/stream` client is connected, OLED line *recording* / *off*; firmware only.
 3. **Battery you can trust** (nurse, doctor, visually impaired): divider fitted in every wearable

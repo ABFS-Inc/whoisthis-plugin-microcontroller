@@ -33,6 +33,10 @@ jobs:
         run: >
           arduino-cli compile --warnings default --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/whoisthis_xiao_sense
           --build-property "compiler.cpp.extra_flags=-DWIT_OLED=1 -DWIT_BATTERY_PIN=1 -DWIT_BUZZER_PIN=3"
+      - name: Compile (capture-on-tap fob)
+        run: >
+          arduino-cli compile --warnings default --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi firmware/whoisthis_xiao_sense
+          --build-property "compiler.cpp.extra_flags=-DWIT_CAPTURE_ON_TAP=1 -DWIT_BATTERY_PIN=1 -DWIT_BUZZER_PIN=3"
       - uses: actions/upload-artifact@v4
         with:
           name: firmware

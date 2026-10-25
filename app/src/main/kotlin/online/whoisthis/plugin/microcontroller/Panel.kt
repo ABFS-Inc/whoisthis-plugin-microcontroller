@@ -30,16 +30,19 @@ object Panel {
         if (list.isEmpty()) return NO_BOARDS
         return list.joinToString("\n") { b ->
             val caps = b.capabilities.ifEmpty { Devices.assumedCapabilities }.joinToString(",")
-            "${b.name} · ${b.host} · ${b.source.name.lowercase()} · $caps"
+            "${b.name} · ${b.host} · ${b.source.name.lowercase()}" + (if (b.captureOnTap) " · on tap" else "") + " · $caps"
         }
     }
 
-    /** Output panel after a board connects: what the board can show or say, if anything. */
+    const val ON_TAP = "Press the board's button to take a picture; nothing is captured in between."
+
+    /** Output panel after a board connects: how it captures, and what it can show or say, if anything. */
     fun connected(b: Board, caps: List<String>): String {
         val shows = "display.text" in caps
         val speaks = "audio.tts" in caps || "audio.bytes" in caps
-        if (shows) return ""
-        return "${b.name} has no display. Results appear in the WhoIsThis app" +
+        val mode = if (b.captureOnTap) ON_TAP + "\n" else ""
+        if (shows) return mode.trimEnd()
+        return mode + "${b.name} has no display. Results appear in the WhoIsThis app" +
             if (speaks) " and are spoken by the board." else " (the board blinks its LED on each result)."
     }
 

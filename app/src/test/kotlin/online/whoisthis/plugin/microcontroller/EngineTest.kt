@@ -66,13 +66,23 @@ class EngineTest {
         val hosts = CopyOnWriteArrayList<String>()
         @Volatile var eventsServed = false
         @Volatile var streamsOpened = 0
+        /** `capture` the status reports; on_tap makes [capture] behave like the fob firmware's long-poll. */
+        @Volatile var captureMode = Protocol.CAPTURE_CONTINUOUS
+        val waits = CopyOnWriteArrayList<Int>()
+        /** Presses the fob answers the next long-poll with; drained one per poll. */
+        val presses = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
 
         override fun status(host: String): BoardStatus {
             hosts += host
             if (host == "down.local") throw IOException("unreachable")
-            return BoardStatus("xiao-1", "XIAO ESP32-S3 Sense", "1.0.0", 1, caps, battery, 81)
+            return BoardStatus("xiao-1", "XIAO ESP32-S3 Sense", "1.0.0", 1, caps, battery, 81, captureMode)
         }
-        override fun capture(host: String, maxLongSide: Int): ByteArray = still
+        override fun capture(host: String, maxLongSide: Int, waitMs: Int): ByteArray? {
+            waits += waitMs
+            if (waitMs == 0) return still
+            // A fob holds the request until a press or the end of the wait (shortened here); 204 → null.
+            return presses.poll(150, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
         override fun stream(host: String, streamPort: Int, maxLongSide: Int): Mjpeg {
             streamsOpened++
             assertEquals(81, streamPort)
@@ -164,6 +174,34 @@ class EngineTest {
         Engine.stop()
         settle { sink.states.last().first == DeviceState.STOPPED }
         assertEquals(DeviceState.STOPPED to "stopped", sink.states.last())
+    }
+
+    @Test
+    fun captureOnTapBoardDeliversOneStillPerPressAndNothingInBetween() {
+        board.captureMode = Protocol.CAPTURE_ON_TAP
+        board.caps = listOf(Capability.CAMERA_STILL, Capability.INPUT_TAP, Capability.INPUT_LONG_PRESS)
+        Engine.setManualHost("fob.local")
+        Engine.start("fob.local", StreamRequest(preferStream = true, stillIntervalMs = 50), sink)
+        settle { board.waits.size >= 3 }
+        assertEquals(listOf(DeviceState.CONNECTING, DeviceState.CONNECTED, DeviceState.STREAMING), sink.states.map { it.first }.take(3))
+        assertEquals("on_tap", sink.states[2].second)
+        assertTrue("every poll is a long-poll: ${board.waits}", board.waits.all { it == Engine.ON_TAP_WAIT_MS })
+        assertTrue("no still without a press", sink.stills.isEmpty())
+        assertTrue("screen explains the mode: ${Engine.display.value}", Engine.display.value.startsWith(Panel.ON_TAP))
+
+        board.presses.put(board.still)
+        settle { sink.stills.size >= 1 }
+        val (info, bytes) = sink.stills.single()
+        assertArrayEquals(board.still, bytes)
+        assertEquals(FrameKind.STILL, info.kind)
+        assertEquals(640, info.width)
+        val polls = board.waits.size
+        settle(400) { false }
+        assertEquals("one press, one still", 1, sink.stills.size)
+        assertTrue("polling continues while idle", board.waits.size > polls)
+        assertEquals(DeviceState.STREAMING, Engine.listDevices().first { it.id == "fob.local" }.state)
+        Engine.stop()
+        settle { sink.states.last().first == DeviceState.STOPPED }
     }
 
     @Test

@@ -4,7 +4,7 @@
 #pragma once
 
 #ifndef WIT_FIRMWARE_VERSION
-#define WIT_FIRMWARE_VERSION "1.0.0"
+#define WIT_FIRMWARE_VERSION "1.1.0"
 #endif
 #ifndef WIT_PROTOCOL_VERSION
 #define WIT_PROTOCOL_VERSION 1
@@ -30,6 +30,28 @@
 #endif
 #ifndef WIT_STREAM_PORT
 #define WIT_STREAM_PORT 81
+#endif
+
+// Capture-on-tap ("fob") mode. 1 = the board only takes a picture when its button is pressed:
+// the plugin long-polls GET /capture?wait=MS, which answers with a JPEG after the next press or
+// 204 when the wait runs out. The stream server (:81) is compiled out, camera.stream is not
+// advertised, Wi-Fi uses maximum modem sleep and the camera is powered down between presses.
+// Needs WIT_BUTTON_PIN. 0 = the usual continuous device (stream or stills on the app's schedule).
+#ifndef WIT_CAPTURE_ON_TAP
+#define WIT_CAPTURE_ON_TAP 0
+#endif
+// Longest wait /capture?wait= may ask for; the plugin asks for 25 s and retries.
+#ifndef WIT_CAPTURE_WAIT_MAX_MS
+#define WIT_CAPTURE_WAIT_MAX_MS 30000
+#endif
+// In capture-on-tap mode: 1 = de-initialise the camera while idle (its sensor and DMA otherwise
+// draw tens of mA around the clock) and bring it back on the press, discarding a few frames so
+// exposure settles. Costs roughly half a second per press. 0 = keep the camera running.
+#ifndef WIT_CAPTURE_ON_TAP_CAMERA_OFF
+#define WIT_CAPTURE_ON_TAP_CAMERA_OFF 1
+#endif
+#ifndef WIT_CAMERA_WARMUP_FRAMES
+#define WIT_CAMERA_WARMUP_FRAMES 2
 #endif
 
 // JPEG quality (lower = better, bigger). 12 keeps a 1280px frame well under the 1 MB ring slot.
@@ -74,7 +96,8 @@
 #define WIT_OLED_ADDR 0x3C
 #endif
 
-// Optional passive buzzer. -1 disables; otherwise a short chirp accompanies a spoken label.
+// Optional passive buzzer. -1 disables; otherwise a short chirp accompanies a spoken label and
+// a shorter, higher one acknowledges a button press.
 #ifndef WIT_BUZZER_PIN
 #define WIT_BUZZER_PIN -1
 #endif

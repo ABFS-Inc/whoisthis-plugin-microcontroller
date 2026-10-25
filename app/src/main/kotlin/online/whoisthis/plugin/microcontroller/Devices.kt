@@ -14,6 +14,8 @@ data class Board(
     val capabilities: List<String> = emptyList(),
     val streamPort: Int = Protocol.DEFAULT_STREAM_PORT,
     val source: Source = Source.MANUAL,
+    /** The board shoots only on a button press (fob firmware); the engine long-polls instead of scheduling stills. */
+    val captureOnTap: Boolean = false,
 ) {
     enum class Source { MDNS, MANUAL }
 
@@ -22,6 +24,7 @@ data class Board(
         model = s.model,
         capabilities = s.capabilities,
         streamPort = s.streamPort,
+        captureOnTap = s.onTap,
     )
 }
 

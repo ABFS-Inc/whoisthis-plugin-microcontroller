@@ -119,7 +119,8 @@ who needs consent to be obvious; the **puck** serves anyone with a desk or a doo
 
 ## Follow-ups the catalogue implies
 
-- Firmware `WIT_CAPTURE_ON_TAP` mode for the fob (capture only on a press, modem sleep between).
+- ~~Firmware `WIT_CAPTURE_ON_TAP` mode for the fob~~ — done (firmware 1.1: `/capture?wait=`, stream
+  server compiled out, modem sleep and camera off between presses); bench-measure standby current.
 - Firmware `WIT_LED_RING` (WS2812, 12 px) for the lens-ring builds; `WIT_SPEAKER` for a device-side
   chirp, which would let the plugin report `audio.bytes`.
 - A 24-pin FPC extension verified on the bench (pitch, contact side, length) to unlock the split builds.

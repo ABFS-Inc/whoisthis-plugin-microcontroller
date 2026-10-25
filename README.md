@@ -21,7 +21,7 @@ on the same phone. Nothing leaves the phone; the plugin declares no internet dom
 | Path | Role |
 |------|------|
 | `app/src/main/kotlin/.../CaptureDeviceService.kt` | Binder service; every call verifies the caller is `online.whoisthis.whoisthis` signed with the pinned key (`trustedCallerSha256` in `gradle.properties`). Debug builds skip the signer check, never the package check. |
-| `Engine.kt` | One capture at a time: `GET /whoisthis` → `CONNECTED` with the board's confirmed capabilities, then MJPEG into the ring (reconnecting on drops) or stills over a pipe; polls `/events` for `tap` / `long_press` / `battery`; `present()` → `POST /present` (OLED text, LED blink, buzzer). No Activity is needed: a start from the app runs straight away. |
+| `Engine.kt` | One capture at a time: `GET /whoisthis` → `CONNECTED` with the board's confirmed capabilities, then MJPEG into the ring (reconnecting on drops), stills over a pipe, or (fob firmware, `capture=on_tap`) one still per button press by long-polling `/capture?wait=`; polls `/events` for `tap` / `long_press` / `battery`; `present()` → `POST /present` (OLED text, LED blink, buzzer). No Activity is needed: a start from the app runs straight away. |
 | `Protocol.kt`, `Board.kt` | The firmware's HTTP protocol (status/events JSON, MJPEG part reader, JPEG size from the SOF marker) and the `HttpURLConnection` transport behind a test seam. |
 | `Discovery.kt`, `Devices.kt` | mDNS (`_whoisthis._tcp`) discovery through Android NSD, plus one typed address; boards → contract `DeviceInfo` (the host is the device id). |
 | `PluginActivity.kt` | Plugin screen: discovered boards, add by address, connect/disconnect, capture facts and the latest frame (in memory only), what was sent to the board. |
@@ -47,9 +47,11 @@ plugin's); publishing needs `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`.
    as `whoisthis-cam-XXXX`; if your network blocks multicast, open the plugin screen and type its IP.
 3. Start it from the app like any other capture source. Tap the board's button to trigger a lookup,
    long-press to stop; the LED blinks when the app presents a label (and the OLED shows it when fitted).
+   A board built with `WIT_CAPTURE_ON_TAP` (the fob) sends a picture only when its button is pressed;
+   the plugin screen says so when it connects.
 
 Device states and detail strings follow the contract (`connecting`, `connected <caps>`,
-`streaming` / `streaming stills`, `error <reason>`); the plugin screen's status line and the line
+`streaming` / `streaming stills` / `streaming on_tap`, `error <reason>`); the plugin screen's status line and the line
 under the device in the WhoIsThis app carry the same text. `adb logcat -s wit.mcu` has the stack trace.
 
 ## Trust

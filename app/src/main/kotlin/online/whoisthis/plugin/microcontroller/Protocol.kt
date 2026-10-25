@@ -11,7 +11,7 @@ import java.io.InputStream
  * The HTTP protocol the WhoIsThis firmware speaks (see firmware/README.md). Pure parsing, no I/O:
  *
  * - `GET /whoisthis`        → [BoardStatus] JSON
- * - `GET /capture?max=N`    → one `image/jpeg`
+ * - `GET /capture?max=N`    → one `image/jpeg`; `&wait=MS` → one taken after the next button press, or 204
  * - `GET :81/stream?max=N`  → `multipart/x-mixed-replace`, one JPEG per part ([Mjpeg])
  * - `GET /events?after=N`   → queued button/battery events ([BoardEvents])
  * - `POST /present`         → `{"text","show","speak"}`
@@ -20,10 +20,14 @@ object Protocol {
     /** Protocol generation; the firmware reports its own in [BoardStatus.protocol]. */
     const val VERSION = 1
 
-    /** mDNS service type boards advertise; TXT carries `id`, `model`, `caps`, `stream_port`. */
+    /** mDNS service type boards advertise; TXT carries `id`, `model`, `caps`, `capture`, `stream_port`. */
     const val SERVICE_TYPE = "_whoisthis._tcp."
     const val DEFAULT_PORT = 80
     const val DEFAULT_STREAM_PORT = 81
+
+    /** `capture` values: frames whenever asked, or only after a button press (`/capture?wait=`). */
+    const val CAPTURE_CONTINUOUS = "continuous"
+    const val CAPTURE_ON_TAP = "on_tap"
 
     fun presentBody(text: String, show: Boolean, speak: Boolean): String =
         JSONObject().put("text", text).put("show", show).put("speak", speak).toString()
@@ -39,7 +43,11 @@ data class BoardStatus(
     /** Percent, or null when the board has no battery sense. */
     val battery: Int?,
     val streamPort: Int,
+    /** [Protocol.CAPTURE_CONTINUOUS] or [Protocol.CAPTURE_ON_TAP]; firmware 1.0 sent nothing, which means continuous. */
+    val capture: String = Protocol.CAPTURE_CONTINUOUS,
 ) {
+    val onTap: Boolean get() = capture == Protocol.CAPTURE_ON_TAP
+
     companion object {
         fun parse(json: String): BoardStatus {
             val o = JSONObject(json)
@@ -53,6 +61,7 @@ data class BoardStatus(
                 capabilities = caps.filter { it in Capability.ALL },
                 battery = if (o.has("battery") && !o.isNull("battery")) o.getInt("battery") else null,
                 streamPort = o.optInt("stream_port", Protocol.DEFAULT_STREAM_PORT),
+                capture = o.optString("capture", Protocol.CAPTURE_CONTINUOUS),
             )
         }
     }

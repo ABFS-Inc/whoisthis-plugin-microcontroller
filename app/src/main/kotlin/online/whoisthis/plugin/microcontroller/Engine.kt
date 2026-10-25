@@ -35,6 +35,9 @@ import java.util.UUID
  * One capture at a time, owned by the process. Unlike the glasses plugin nothing here needs an
  * Activity: the board is an HTTP server on the LAN, so a start from the app runs straight away.
  * The plugin screen only adds boards (mDNS scan, typed address) and mirrors the capture.
+ *
+ * Three ways a board delivers pictures, chosen after `/whoisthis` answers: MJPEG into the ring,
+ * stills on the app's interval, or (fob firmware, `capture: on_tap`) a still per button press.
  */
 object Engine {
     private const val TAG = "wit.mcu"
@@ -43,6 +46,9 @@ object Engine {
     private const val EVENT_RETRY_MS = 2_000L
     private const val RECONNECT_MS = 1_000L
     private const val MAX_CONSECUTIVE_FAILURES = 5
+    /** How long one `/capture?wait=` holds on a capture-on-tap board; the firmware caps it at 30 s. */
+    internal const val ON_TAP_WAIT_MS = 25_000
+    private const val ON_TAP_RETRY_MS = 1_000L
     private const val DISCOVERY_WINDOW_MS = 30_000L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -187,7 +193,11 @@ object Engine {
         if (caps.any { it == Capability.INPUT_TAP || it == Capability.INPUT_LONG_PRESS || it == Capability.BATTERY }) {
             scope.launch(Dispatchers.IO) { pollEvents(c) }.also { ev -> c.job?.invokeOnCompletion { ev.cancel() } }
         }
-        if (c.request.preferStream && Capability.CAMERA_STREAM in caps) stream(c) else stills(c)
+        when {
+            c.live.captureOnTap -> stillsOnTap(c)
+            c.request.preferStream && Capability.CAMERA_STREAM in caps -> stream(c)
+            else -> stills(c)
+        }
     }
 
     private suspend fun pollEvents(c: Capture) {
@@ -262,7 +272,7 @@ object Engine {
         var failures = 0
         while (currentCoroutineIsActive()) {
             val jpeg = try {
-                transport.capture(c.board.host, c.request.maxLongSide)
+                transport.capture(c.board.host, c.request.maxLongSide) ?: continue
             } catch (e: IOException) {
                 if (++failures > MAX_CONSECUTIVE_FAILURES) throw e
                 Log.w(TAG, "capture failed; retry $failures/$MAX_CONSECUTIVE_FAILURES", e)
@@ -271,22 +281,50 @@ object Engine {
                 continue
             }
             failures = 0
-            val (w, h) = Jpeg.dimensions(jpeg) ?: (0 to 0)
-            record(w, h, jpeg, still = true)
-            // The writer runs alongside the app's read (a pipe holds 64 KB; a frame is bigger), and
-            // our read end closes only afterwards so an in-process sink can still drain it.
-            val pipe = ParcelFileDescriptor.createPipe()
-            val writer = scope.launch(Dispatchers.IO) {
-                ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { it.write(jpeg) }
-            }
-            try {
-                c.sink.onStill(info(c, FrameKind.STILL, w, h, 0), pipe[0])
-                writer.join()
-            } finally {
-                writer.cancel()
-                pipe[0].close()
-            }
+            deliverStill(c, jpeg)
             delay(c.request.stillIntervalMs.toLong())
+        }
+    }
+
+    /**
+     * Capture-on-tap boards: one long-poll after another, each answered with a JPEG when the
+     * button is pressed or empty when the wait runs out. The app's still interval does not apply;
+     * the person holding the fob decides when a picture is taken. A failure only pauses the poll:
+     * the board is probably asleep or roaming, and the person will press again.
+     */
+    private suspend fun stillsOnTap(c: Capture) {
+        emit(c, DeviceState.STREAMING, "on_tap")
+        var failures = 0
+        while (currentCoroutineIsActive()) {
+            val jpeg = try {
+                transport.capture(c.board.host, c.request.maxLongSide, ON_TAP_WAIT_MS)
+            } catch (e: IOException) {
+                if (++failures > MAX_CONSECUTIVE_FAILURES) throw e
+                Log.w(TAG, "wait for press failed; retry $failures/$MAX_CONSECUTIVE_FAILURES", e)
+                facts.value = facts.value.copy(lastError = "${describe(e)} (retry $failures/$MAX_CONSECUTIVE_FAILURES)")
+                delay(ON_TAP_RETRY_MS)
+                continue
+            }
+            failures = 0
+            if (jpeg != null) deliverStill(c, jpeg)
+        }
+    }
+
+    private suspend fun deliverStill(c: Capture, jpeg: ByteArray) {
+        val (w, h) = Jpeg.dimensions(jpeg) ?: (0 to 0)
+        record(w, h, jpeg, still = true)
+        // The writer runs alongside the app's read (a pipe holds 64 KB; a frame is bigger), and
+        // our read end closes only afterwards so an in-process sink can still drain it.
+        val pipe = ParcelFileDescriptor.createPipe()
+        val writer = scope.launch(Dispatchers.IO) {
+            ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { it.write(jpeg) }
+        }
+        try {
+            c.sink.onStill(info(c, FrameKind.STILL, w, h, 0), pipe[0])
+            writer.join()
+        } finally {
+            writer.cancel()
+            pipe[0].close()
         }
     }
 

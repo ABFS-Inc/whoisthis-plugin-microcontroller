@@ -1,6 +1,7 @@
 // firmware/whoisthis_xiao_sense/config.h overrides for the point-and-ask fob build.
 #pragma once
 #define WIT_MODEL "WhoIsThis fob"
+#define WIT_CAPTURE_ON_TAP 1    // press-to-ask: a picture only on a press, no stream server, radio and camera asleep between
 #define WIT_BUTTON_PIN 2        // D1: tail button (tap = one lookup, long press = stop)
 #define WIT_BATTERY_PIN 1       // A0: 220k/220k divider from BAT+
 #define WIT_BATTERY_DIVIDER 2.0f

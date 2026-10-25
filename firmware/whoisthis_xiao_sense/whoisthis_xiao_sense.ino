@@ -5,12 +5,14 @@
 //
 //   GET  /whoisthis         JSON: id, model, firmware, protocol, capabilities[], battery, stream_port
 //   GET  /capture?max=N     one JPEG, long side <= N
+//        &wait=MS           ...taken after the next button press; 204 if none within MS
 //   GET  :81/stream?max=N   multipart/x-mixed-replace MJPEG, Content-Length on every part
+//                           (not built with WIT_CAPTURE_ON_TAP: the fob only shoots on a press)
 //   GET  /events?after=N    {"next":M,"events":[{"seq","name","detail"}]}  (tap, long_press, battery)
 //   POST /present           {"text","show","speak"}: OLED text (if fitted), LED blink, buzzer chirp
 //   GET  /                  human status page;  POST /wifi  ssid=&pass=  saves credentials, restarts
 //
-// Discovery: mDNS _whoisthis._tcp on the HTTP port, TXT id/model/caps/stream_port/fw.
+// Discovery: mDNS _whoisthis._tcp on the HTTP port, TXT id/model/caps/capture/stream_port/fw.
 // Frames go to whoever asks on the LAN; the plugin is the only intended client. Nothing leaves it.
 
 #include <WiFi.h>
@@ -28,6 +30,11 @@
 #include <Adafruit_SSD1306.h>
 static Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 #endif
+
+#if WIT_CAPTURE_ON_TAP && WIT_BUTTON_PIN < 0
+#error "WIT_CAPTURE_ON_TAP needs a button: set WIT_BUTTON_PIN"
+#endif
+#define WIT_HAS_STREAM (!WIT_CAPTURE_ON_TAP)
 
 // ---------------------------------------------------------------- identity
 
@@ -98,6 +105,37 @@ static void sampleBattery(bool force) {
 
 // ---------------------------------------------------------------- button
 
+// A tap that nobody is waiting for yet stays claimable this long, so a press that lands between two
+// of the plugin's long-polls (a few ms apart) is not lost.
+static const uint32_t PRESS_GRACE_MS = 3000;
+static bool g_pressPending = false;
+static uint32_t g_pressAt = 0;
+static uint32_t g_blinkUntil = 0;
+// Guards the press flag and the parked /capture request, which the httpd task and loop() both touch.
+static portMUX_TYPE g_pressMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void onTap() {
+  pushEvent("tap", "1");
+  portENTER_CRITICAL(&g_pressMux);
+  g_pressPending = true;
+  g_pressAt = millis();
+  portEXIT_CRITICAL(&g_pressMux);
+  if (g_blinkUntil < millis() + 120) g_blinkUntil = millis() + 120;  // one short blink: press seen
+#if WIT_BUZZER_PIN >= 0
+  tone(WIT_BUZZER_PIN, 2200, 30);
+#endif
+}
+
+/** True once if a press is pending and younger than the grace period; consumes it. */
+static bool takePress() {
+  portENTER_CRITICAL(&g_pressMux);
+  bool had = g_pressPending;
+  uint32_t at = g_pressAt;
+  g_pressPending = false;
+  portEXIT_CRITICAL(&g_pressMux);
+  return had && millis() - at <= PRESS_GRACE_MS;
+}
+
 static void pollButton() {
 #if WIT_BUTTON_PIN >= 0
   static bool down = false;
@@ -109,14 +147,13 @@ static void pollButton() {
   else if (pressed && down && !longSent && now - downAt >= WIT_LONG_PRESS_MS) { longSent = true; pushEvent("long_press", ""); }
   else if (!pressed && down) {
     down = false;
-    if (!longSent && now - downAt >= 30) pushEvent("tap", "1");  // 30 ms debounce
+    if (!longSent && now - downAt >= 30) onTap();  // 30 ms debounce
   }
 #endif
 }
 
 // ---------------------------------------------------------------- output (present)
 
-static uint32_t g_blinkUntil = 0;
 static String g_shown;
 
 static void pollLed() {
@@ -194,6 +231,40 @@ static void applyMax(int maxLong) {
   if (s && s->set_framesize(s, f) == 0) g_framesize = f;
 }
 
+// In capture-on-tap mode the camera is de-initialised while nobody is pressing: the sensor and
+// its DMA otherwise run at full tilt around the clock. Waking takes a few hundred ms and the
+// first frames are under-exposed, so grabFrame() discards WIT_CAMERA_WARMUP_FRAMES after a wake.
+static bool g_cameraSleeping = false;
+
+static bool cameraWake() {
+  if (!g_cameraSleeping) return g_cameraOk;
+  g_cameraOk = initCamera();
+  g_cameraSleeping = !g_cameraOk;
+  return g_cameraOk;
+}
+
+static void cameraSleep() {
+#if WIT_CAPTURE_ON_TAP && WIT_CAPTURE_ON_TAP_CAMERA_OFF
+  if (g_cameraSleeping || !g_cameraOk) return;
+  esp_camera_deinit();
+  g_cameraSleeping = true;
+#endif
+}
+
+/** One fresh frame at the requested size, or nullptr. The caller returns it with esp_camera_fb_return. */
+static camera_fb_t* grabFrame(int maxLong) {
+  bool woke = g_cameraSleeping;
+  if (!cameraWake()) return nullptr;
+  applyMax(maxLong);
+  if (woke) {
+    for (int i = 0; i < WIT_CAMERA_WARMUP_FRAMES; i++) {
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (fb) esp_camera_fb_return(fb);
+    }
+  }
+  return esp_camera_fb_get();
+}
+
 static int queryInt(httpd_req_t* req, const char* key, int dflt) {
   char buf[64], val[16];
   if (httpd_req_get_url_query_str(req, buf, sizeof buf) != ESP_OK) return dflt;
@@ -203,21 +274,24 @@ static int queryInt(httpd_req_t* req, const char* key, int dflt) {
 
 // ---------------------------------------------------------------- JSON helpers
 
-static String capabilitiesJson() {
-  String j = "[\"camera.still\",\"camera.stream\"";
-  if (WIT_BUTTON_PIN >= 0) j += ",\"input.tap\",\"input.long_press\"";
-  if (WIT_BATTERY_PIN >= 0) j += ",\"battery\"";
-  if (g_oledOk) j += ",\"display.text\"";
-  return j + "]";
-}
-
 static String capabilitiesTxt() {
-  String t = "camera.still,camera.stream";
+  String t = "camera.still";
+  if (WIT_HAS_STREAM) t += ",camera.stream";
   if (WIT_BUTTON_PIN >= 0) t += ",input.tap,input.long_press";
   if (WIT_BATTERY_PIN >= 0) t += ",battery";
   if (g_oledOk) t += ",display.text";
   return t;
 }
+
+static String capabilitiesJson() {
+  String t = capabilitiesTxt();
+  t.replace(",", "\",\"");
+  return "[\"" + t + "\"]";
+}
+
+// How the board takes pictures: "continuous" (stream or stills whenever asked) or "on_tap"
+// (a frame only after a button press; the plugin long-polls /capture?wait=).
+static const char* CAPTURE_MODE = WIT_CAPTURE_ON_TAP ? "on_tap" : "continuous";
 
 static String jsonEscape(const String& s) {
   String o;
@@ -267,8 +341,9 @@ static bool jsonBool(const String& body, const char* key, bool dflt) {
 
 static esp_err_t handleStatus(httpd_req_t* req) {
   String j = "{\"id\":\"" + g_id + "\",\"model\":\"" WIT_MODEL "\",\"firmware\":\"" WIT_FIRMWARE_VERSION "\",\"protocol\":" +
-             String(WIT_PROTOCOL_VERSION) + ",\"capabilities\":" + capabilitiesJson() + ",\"battery\":" +
-             (g_battery >= 0 ? String(g_battery) : String("null")) + ",\"stream_port\":" + String(WIT_STREAM_PORT) +
+             String(WIT_PROTOCOL_VERSION) + ",\"capabilities\":" + capabilitiesJson() + ",\"capture\":\"" + CAPTURE_MODE +
+             "\",\"battery\":" + (g_battery >= 0 ? String(g_battery) : String("null")) +
+             (WIT_HAS_STREAM ? ",\"stream_port\":" + String(WIT_STREAM_PORT) : String()) +
              ",\"camera\":" + (g_cameraOk ? "true" : "false") + ",\"rssi\":" + String(WiFi.RSSI()) +
              ",\"uptime_s\":" + String(millis() / 1000) + "}";
   httpd_resp_set_type(req, "application/json");
@@ -276,16 +351,77 @@ static esp_err_t handleStatus(httpd_req_t* req) {
   return httpd_resp_send(req, j.c_str(), j.length());
 }
 
-static esp_err_t handleCapture(httpd_req_t* req) {
-  if (!g_cameraOk) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera not initialised");
-  applyMax(queryInt(req, "max", 1280));
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "capture failed");
-  httpd_resp_set_type(req, "image/jpeg");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  esp_err_t r = httpd_resp_send(req, (const char*)fb->buf, fb->len);
-  esp_camera_fb_return(fb);
+// The httpd task (an immediate /capture) and loop() (a parked one) may both want the camera.
+static SemaphoreHandle_t g_camMutex = nullptr;
+
+static esp_err_t sendCapture(httpd_req_t* req, int maxLong) {
+  xSemaphoreTake(g_camMutex, portMAX_DELAY);
+  esp_err_t r;
+  camera_fb_t* fb = g_cameraOk ? grabFrame(maxLong) : nullptr;
+  if (!fb) {
+    r = httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, g_cameraOk ? "capture failed" : "camera not initialised");
+  } else {
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-Capture", CAPTURE_MODE);
+    r = httpd_resp_send(req, (const char*)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+  }
+  cameraSleep();
+  xSemaphoreGive(g_camMutex);
   return r;
+}
+
+// /capture?wait=MS parks the request (ESP-IDF async handler) and loop() answers it on the next
+// button press, or with 204 when the wait runs out. Parking keeps the control server free for
+// /events and /present meanwhile. One waiter at a time: a newer wait displaces the older one.
+static httpd_req_t* g_waiter = nullptr;
+static uint32_t g_waitUntil = 0;
+static int g_waitMax = 1280;
+
+/** Detaches the parked request, if any, so exactly one task answers it. */
+static httpd_req_t* takeWaiter(int* maxLong) {
+  portENTER_CRITICAL(&g_pressMux);
+  httpd_req_t* r = g_waiter;
+  g_waiter = nullptr;
+  if (maxLong) *maxLong = g_waitMax;
+  portEXIT_CRITICAL(&g_pressMux);
+  return r;
+}
+
+static void answerWaiter(httpd_req_t* r, bool shoot, int maxLong) {
+  if (!r) return;
+  if (shoot) sendCapture(r, maxLong);
+  else { httpd_resp_set_status(r, "204 No Content"); httpd_resp_send(r, nullptr, 0); }
+  httpd_req_async_handler_complete(r);
+}
+
+static esp_err_t handleCapture(httpd_req_t* req) {
+  int maxLong = queryInt(req, "max", 1280);
+  int wait = queryInt(req, "wait", 0);
+  if (wait <= 0 || WIT_BUTTON_PIN < 0) return sendCapture(req, maxLong);
+  if (wait > WIT_CAPTURE_WAIT_MAX_MS) wait = WIT_CAPTURE_WAIT_MAX_MS;
+  httpd_req_t* parked = nullptr;
+  if (httpd_req_async_handler_begin(req, &parked) != ESP_OK)
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "cannot park request");
+  answerWaiter(takeWaiter(nullptr), false, 0);  // the previous poller, if any, gets an empty answer
+  portENTER_CRITICAL(&g_pressMux);
+  g_waiter = parked;
+  g_waitUntil = millis() + wait;
+  g_waitMax = maxLong;
+  portEXIT_CRITICAL(&g_pressMux);
+  if (takePress()) answerWaiter(takeWaiter(&maxLong), true, maxLong);  // pressed just before the poll arrived
+  return ESP_OK;
+}
+
+static void pollWaiter() {
+  if (!g_waiter) {
+    if (g_pressPending && millis() - g_pressAt > PRESS_GRACE_MS) takePress();  // let a stale press lapse
+    return;
+  }
+  int maxLong;
+  if (takePress()) answerWaiter(takeWaiter(&maxLong), true, maxLong);
+  else if ((int32_t)(millis() - g_waitUntil) >= 0) answerWaiter(takeWaiter(nullptr), false, 0);
 }
 
 static esp_err_t handleEvents(httpd_req_t* req) {
@@ -347,9 +483,12 @@ static esp_err_t handleRoot(httpd_req_t* req) {
     h += "<p>Not on a Wi-Fi network yet. Enter your network below; the board restarts and joins it.</p>";
   } else {
     h += "<p>On <b>" + WiFi.SSID() + "</b> as <code>" + WiFi.localIP().toString() + "</code>, RSSI " + String(WiFi.RSSI()) +
-         " dBm. Camera " + (g_cameraOk ? "ready" : "<b>failed</b>") + ". Capabilities: <code>" + capabilitiesTxt() + "</code>.</p>"
-         "<p><a href='/capture?max=640'>Still</a> · <a href='http://" + WiFi.localIP().toString() + ":" + String(WIT_STREAM_PORT) +
-         "/stream?max=640'>Stream</a> · <a href='/whoisthis'>Status JSON</a></p>"
+         " dBm. Camera " + (g_cameraOk ? (g_cameraSleeping ? "asleep until the next press" : "ready") : "<b>failed</b>") +
+         ". Capture: <code>" + CAPTURE_MODE + "</code>. Capabilities: <code>" + capabilitiesTxt() + "</code>.</p>"
+         "<p><a href='/capture?max=640'>Still</a>" +
+         (WIT_HAS_STREAM ? " · <a href='http://" + WiFi.localIP().toString() + ":" + String(WIT_STREAM_PORT) + "/stream?max=640'>Stream</a>" : String()) +
+         (WIT_BUTTON_PIN >= 0 ? " · <a href='/capture?max=640&wait=20000'>Still on next press</a>" : "") +
+         " · <a href='/whoisthis'>Status JSON</a></p>"
          "<p>Last shown: <code>" + htmlEscape(g_shown) + "</code></p>";
   }
   h += "<form method=post action='/wifi'><p><label>Wi-Fi name <input name=ssid required></label></p>"
@@ -401,6 +540,7 @@ static esp_err_t handleNotFound(httpd_req_t* req, httpd_err_code_t) {
 
 // ---------------------------------------------------------------- HTTP handler (stream, :81)
 
+#if WIT_HAS_STREAM
 static const char* STREAM_BOUNDARY = "whoisthisframe";
 
 static esp_err_t handleStream(httpd_req_t* req) {
@@ -422,18 +562,21 @@ static esp_err_t handleStream(httpd_req_t* req) {
     if (r != ESP_OK) return r;  // client went away
   }
 }
+#endif
 
 // ---------------------------------------------------------------- servers
 
 static httpd_handle_t g_control = nullptr;
+#if WIT_HAS_STREAM
 static httpd_handle_t g_stream = nullptr;
+#endif
 
 static void startServers() {
   httpd_config_t c = HTTPD_DEFAULT_CONFIG();
   c.server_port = WIT_HTTP_PORT;
   c.ctrl_port = 32768;
   c.max_uri_handlers = 8;
-  c.lru_purge_enable = true;
+  c.lru_purge_enable = true;  // a parked /capture?wait= never blocks a new connection
   if (httpd_start(&g_control, &c) == ESP_OK) {
     httpd_uri_t u;
     u = {"/whoisthis", HTTP_GET, handleStatus, nullptr}; httpd_register_uri_handler(g_control, &u);
@@ -444,6 +587,7 @@ static void startServers() {
     u = {"/", HTTP_GET, handleRoot, nullptr}; httpd_register_uri_handler(g_control, &u);
     httpd_register_err_handler(g_control, HTTPD_404_NOT_FOUND, handleNotFound);
   }
+#if WIT_HAS_STREAM
   if (g_apMode) return;  // no streaming until the board is on a real network
   httpd_config_t s = HTTPD_DEFAULT_CONFIG();
   s.server_port = WIT_STREAM_PORT;
@@ -453,6 +597,7 @@ static void startServers() {
     httpd_uri_t u = {"/stream", HTTP_GET, handleStream, nullptr};
     httpd_register_uri_handler(g_stream, &u);
   }
+#endif
 }
 
 // ---------------------------------------------------------------- Wi-Fi
@@ -465,7 +610,11 @@ static bool joinWifi(const String& ssid, const String& pass) {
   WiFi.begin(ssid.c_str(), pass.c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIT_WIFI_CONNECT_TIMEOUT_MS) { delay(200); pollLed(); }
-  return WiFi.status() == WL_CONNECTED;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  // Fob: the radio sleeps between beacons (tens of mA saved; a long-poll wakes it fine).
+  // Continuous: light sleep only, so MJPEG keeps its frame rate.
+  WiFi.setSleep(WIT_CAPTURE_ON_TAP ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM);
+  return true;
 }
 
 static void startAccessPoint() {
@@ -499,8 +648,10 @@ void setup() {
   if (g_oledOk) { oled.setTextColor(SSD1306_WHITE); showText("WhoIsThis\nstarting"); }
 #endif
 
+  g_camMutex = xSemaphoreCreateMutex();
   g_cameraOk = initCamera();
-  Serial.printf("camera: %s\n", g_cameraOk ? "ok" : "FAILED");
+  Serial.printf("camera: %s (%s)\n", g_cameraOk ? "ok" : "FAILED", CAPTURE_MODE);
+  cameraSleep();  // capture-on-tap with the camera off while idle; a no-op otherwise
 
   g_prefs.begin("wit", true);
   String ssid = g_prefs.getString("ssid", WIT_WIFI_SSID);
@@ -515,7 +666,8 @@ void setup() {
       MDNS.addServiceTxt("whoisthis", "tcp", "id", g_id);
       MDNS.addServiceTxt("whoisthis", "tcp", "model", WIT_MODEL);
       MDNS.addServiceTxt("whoisthis", "tcp", "caps", capabilitiesTxt());
-      MDNS.addServiceTxt("whoisthis", "tcp", "stream_port", String(WIT_STREAM_PORT));
+      MDNS.addServiceTxt("whoisthis", "tcp", "capture", CAPTURE_MODE);
+      if (WIT_HAS_STREAM) MDNS.addServiceTxt("whoisthis", "tcp", "stream_port", String(WIT_STREAM_PORT));
       MDNS.addServiceTxt("whoisthis", "tcp", "fw", WIT_FIRMWARE_VERSION);
       MDNS.addService("http", "tcp", WIT_HTTP_PORT);
     }
@@ -528,6 +680,7 @@ void setup() {
 void loop() {
   if (g_apMode) g_dns.processNextRequest();
   pollButton();
+  pollWaiter();
   pollLed();
   sampleBattery(false);
   if (!g_apMode && WiFi.status() != WL_CONNECTED) {

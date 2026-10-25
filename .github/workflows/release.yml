@@ -77,6 +77,10 @@ jobs:
           arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library"
           arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi --export-binaries firmware/whoisthis_xiao_sense
           cp firmware/whoisthis_xiao_sense/build/esp32.esp32.XIAO_ESP32S3/whoisthis_xiao_sense.ino.merged.bin "out/whoisthis-firmware-xiao-esp32s3-sense-v${{ steps.v.outputs.name }}.bin"
+          # Point-and-ask fob: capture on a press only (docs/blueprints/point-and-ask-fob/config.h), battery divider on A0, buzzer on D2.
+          arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:PSRAM=opi --build-path build-fob firmware/whoisthis_xiao_sense \
+            --build-property "compiler.cpp.extra_flags=-DWIT_CAPTURE_ON_TAP=1 -DWIT_BATTERY_PIN=1 -DWIT_BUZZER_PIN=3"
+          cp build-fob/whoisthis_xiao_sense.ino.merged.bin "out/whoisthis-firmware-xiao-esp32s3-sense-fob-v${{ steps.v.outputs.name }}.bin"
           (cd out && sha256sum *.bin >> SHA256SUMS)
 
       - uses: softprops/action-gh-release@v2

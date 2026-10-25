@@ -35,6 +35,22 @@ class ProtocolTest {
         assertEquals(listOf(Capability.CAMERA_STILL, Capability.CAMERA_STREAM, Capability.BATTERY), s.capabilities)
         assertEquals(87, s.battery)
         assertEquals(81, s.streamPort)
+        assertEquals(Protocol.CAPTURE_CONTINUOUS, s.capture)
+        assertEquals(false, s.onTap)
+    }
+
+    @Test
+    fun statusOfAFobSaysItCapturesOnTap() {
+        val s = BoardStatus.parse(
+            """{"id":"xiao-ab12","model":"WhoIsThis fob","firmware":"1.1.0","protocol":1,
+               "capabilities":["camera.still","input.tap","input.long_press","battery"],"capture":"on_tap","battery":60}""",
+        )
+        assertEquals(true, s.onTap)
+        assertEquals(listOf(Capability.CAMERA_STILL, Capability.INPUT_TAP, Capability.INPUT_LONG_PRESS, Capability.BATTERY), s.capabilities)
+        assertEquals(Protocol.DEFAULT_STREAM_PORT, s.streamPort)
+        val b = Board(host = "10.0.0.9", name = "10.0.0.9").withStatus(s)
+        assertEquals(true, b.captureOnTap)
+        assertEquals("WhoIsThis fob", b.name)
     }
 
     @Test

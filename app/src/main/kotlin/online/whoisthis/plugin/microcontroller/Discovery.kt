@@ -75,6 +75,7 @@ class Discovery(context: Context) {
                 model = txt["model"].orEmpty(),
                 capabilities = Devices.capabilities(txt["caps"]),
                 streamPort = txt["stream_port"]?.toIntOrNull() ?: Protocol.DEFAULT_STREAM_PORT,
+                captureOnTap = txt["capture"] == Protocol.CAPTURE_ON_TAP,
                 source = Board.Source.MDNS,
             )
         }

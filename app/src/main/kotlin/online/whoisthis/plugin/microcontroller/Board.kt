@@ -8,7 +8,11 @@ import java.net.URL
 /** What the engine needs from a board; [HttpBoard] is the real one, tests substitute a fake. */
 interface BoardTransport {
     fun status(host: String): BoardStatus
-    fun capture(host: String, maxLongSide: Int): ByteArray
+    /**
+     * One JPEG. With [waitMs] > 0 the board holds the request until its button is pressed and
+     * returns null (HTTP 204) when nothing happened within the wait; the caller simply asks again.
+     */
+    fun capture(host: String, maxLongSide: Int, waitMs: Int = 0): ByteArray?
     /** An open MJPEG stream; the caller closes it. */
     fun stream(host: String, streamPort: Int, maxLongSide: Int): Mjpeg
     fun events(host: String, after: Long): BoardEvents
@@ -19,8 +23,19 @@ interface BoardTransport {
 class HttpBoard : BoardTransport {
     override fun status(host: String): BoardStatus = BoardStatus.parse(get(url(host, null, "/whoisthis")).readText())
 
-    override fun capture(host: String, maxLongSide: Int): ByteArray =
-        get(url(host, null, "/capture?max=$maxLongSide"), timeoutMs = CAPTURE_TIMEOUT_MS).use { it.readBytes() }
+    override fun capture(host: String, maxLongSide: Int, waitMs: Int): ByteArray? {
+        val path = if (waitMs > 0) "/capture?max=$maxLongSide&wait=$waitMs" else "/capture?max=$maxLongSide"
+        val c = open(url(host, null, path), timeoutMs = CAPTURE_TIMEOUT_MS + waitMs)
+        try {
+            return when (c.responseCode) {
+                200 -> c.inputStream.use { it.readBytes() }
+                204 -> null
+                else -> throw IOException("HTTP ${c.responseCode} from /capture")
+            }
+        } finally {
+            c.disconnect()
+        }
+    }
 
     override fun stream(host: String, streamPort: Int, maxLongSide: Int): Mjpeg {
         val c = open(url(host, streamPort, "/stream?max=$maxLongSide"), timeoutMs = STREAM_READ_TIMEOUT_MS)

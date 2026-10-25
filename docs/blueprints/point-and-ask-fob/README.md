@@ -75,6 +75,9 @@ Antenna ─► U.FL;  camera ─► Sense socket
 
 ## Firmware note
 
-Today the plugin requests stills every 4 s and the app treats `tap` as a lookup trigger. A fob-mode
-(`WIT_CAPTURE_ON_TAP`: `/capture` returns a fresh frame only after a press, Wi-Fi modem-sleeps in
-between) is a small firmware change listed as a follow-up in `../candidates.md`.
+`config.h` here sets `WIT_CAPTURE_ON_TAP 1`: the board takes a picture only when the tail button is
+pressed (the plugin long-polls `/capture?wait=`), has no stream server, and keeps the radio in modem
+sleep and the camera powered down between presses. See *Capture-on-tap mode* in `../../../firmware/README.md`.
+Bench items still open: the standby current (expect a few mA plus Wi-Fi beacons) and the press-to-
+picture time with the camera re-initialised on each press (expect about half a second; set
+`WIT_CAPTURE_ON_TAP_CAMERA_OFF 0` if it feels slow).
