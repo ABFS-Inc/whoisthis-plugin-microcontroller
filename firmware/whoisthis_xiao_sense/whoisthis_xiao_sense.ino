@@ -410,16 +410,25 @@ static esp_err_t handleStream(httpd_req_t* req) {
   httpd_resp_set_type(req, ct.c_str());
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   char head[128];
+  unsigned frames = 0;  // timing log every 100th frame: sensor grab time and send time
   while (true) {
+    uint32_t tGrab = millis();
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) return ESP_FAIL;
+    uint32_t tSend = millis();
     int n = snprintf(head, sizeof head, "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %lu\r\n\r\n",
-                     STREAM_BOUNDARY, (unsigned)fb->len, (unsigned long)millis());
+                     STREAM_BOUNDARY, (unsigned)fb->len, (unsigned long)tSend);
     esp_err_t r = httpd_resp_send_chunk(req, head, n);
     if (r == ESP_OK) r = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
     if (r == ESP_OK) r = httpd_resp_send_chunk(req, "\r\n", 2);
+    size_t len = fb->len;
     esp_camera_fb_return(fb);
     if (r != ESP_OK) return r;  // client went away
+    frames++;
+    if (frames == 1 || frames % 100 == 0) {
+      Serial.printf("wit.timing stream.frame n=%u fb_ms=%lu send_ms=%lu bytes=%u\n", frames,
+                    (unsigned long)(tSend - tGrab), (unsigned long)(millis() - tSend), (unsigned)len);
+    }
   }
 }
 

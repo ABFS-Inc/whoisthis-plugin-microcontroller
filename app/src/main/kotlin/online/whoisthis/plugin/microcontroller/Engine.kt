@@ -55,6 +55,10 @@ object Engine {
         val ringLock = Any()
         var sequence = 0L
         var dropped = 0L
+        /** Timing: when this capture started, parts received, and when the last one arrived. */
+        val startedNanos = System.nanoTime()
+        var parts = 0L
+        var lastPartNanos = 0L
         /** Open stream to close on teardown so a blocked read returns at once. */
         @Volatile var open: java.io.Closeable? = null
         @Volatile var state: String = DeviceState.CONNECTING
@@ -178,7 +182,7 @@ object Engine {
 
     private suspend fun run(c: Capture) {
         emit(c, DeviceState.CONNECTING, "")
-        val s = transport.status(c.board.host)
+        val s = Timing.timed("board.status", "total_ms" to Timing.sinceNanos(c.startedNanos)) { transport.status(c.board.host) }
         c.live = c.board.withStatus(s)
         val caps = c.live.capabilities
         emit(c, DeviceState.CONNECTED, caps.joinToString(","))
@@ -216,7 +220,9 @@ object Engine {
         var failures = 0
         while (true) {
             val mjpeg = try {
-                transport.stream(c.board.host, c.live.streamPort, c.request.maxLongSide)
+                Timing.timed("stream.open", "total_ms" to Timing.sinceNanos(c.startedNanos)) {
+                    transport.stream(c.board.host, c.live.streamPort, c.request.maxLongSide)
+                }
             } catch (e: IOException) {
                 if (++failures > MAX_CONSECUTIVE_FAILURES) throw e
                 facts.value = facts.value.copy(lastError = "${describe(e)} (retry $failures/$MAX_CONSECUTIVE_FAILURES)")
@@ -227,9 +233,23 @@ object Engine {
             emit(c, DeviceState.STREAMING, "")
             try {
                 while (true) {
+                    val waitStart = System.nanoTime()
                     val part = mjpeg.next() ?: throw IOException("stream ended")
+                    val receivedAt = System.currentTimeMillis()
+                    val now = System.nanoTime()
                     failures = 0
-                    deliver(c, part.body, part.headers["x-rotation"]?.toIntOrNull() ?: 0)
+                    val n = ++c.parts
+                    val gapMs = if (c.lastPartNanos == 0L) null else (now - c.lastPartNanos) / 1_000_000
+                    c.lastPartNanos = now
+                    val boardMs = part.headers["x-timestamp"]?.toLongOrNull()
+                    if (n == 1L) Timing.mark("stream.first_part", "total_ms" to Timing.sinceNanos(c.startedNanos), "bytes" to part.body.size)
+                    if (Timing.every(n)) {
+                        Timing.mark(
+                            "frame.received", "src" to "board", "n" to n, "bytes" to part.body.size,
+                            "read_ms" to (now - waitStart) / 1_000_000, "gap_ms" to gapMs, "board_ms" to boardMs,
+                        )
+                    }
+                    deliver(c, part.body, part.headers["x-rotation"]?.toIntOrNull() ?: 0, receivedAt, n)
                 }
             } catch (e: IOException) {
                 currentCoroutineContextEnsureActive()
@@ -244,17 +264,30 @@ object Engine {
         }
     }
 
-    private fun deliver(c: Capture, jpeg: ByteArray, rotation: Int) {
+    /** [receivedAt] is when the part finished arriving from the board (epoch ms); [n] its ordinal. */
+    private fun deliver(c: Capture, jpeg: ByteArray, rotation: Int, receivedAt: Long, n: Long) {
+        val writeStart = System.nanoTime()
         val slot = synchronized(c.ringLock) { c.writer?.write(jpeg) }
         if (slot == null) {
             c.dropped++
+            Timing.mark(
+                "frame.dropped", "reason" to "ring_full", "n" to n, "seq" to c.sequence, "dropped" to c.dropped,
+                "inflight" to synchronized(c.ringLock) { c.writer?.inFlightCount() },
+            )
             facts.value = facts.value.copy(dropped = c.dropped)
             runCatching { c.sink.onEvent(c.board.host, DeviceEvent.DROPPED, c.dropped.toString()) }
             return
         }
+        val writeMs = Timing.sinceNanos(writeStart)
+        if (writeMs > 250 || Timing.every(n)) Timing.mark("ring.write", "ms" to writeMs, "slot" to slot, "bytes" to jpeg.size, "n" to n)
         val (w, h) = Jpeg.dimensions(jpeg) ?: (0 to 0)
         record(w, h, jpeg, still = false)
-        c.sink.onFrame(info(c, FrameKind.FRAME, w, h, rotation), slot, jpeg.size)
+        val info = info(c, FrameKind.FRAME, w, h, rotation)
+        val ageMs = info.timestampMs - receivedAt
+        if (ageMs > 250 || Timing.every(n)) {
+            Timing.mark("frame.handover", "t" to info.timestampMs, "age_ms" to ageMs, "seq" to info.sequence, "bytes" to jpeg.size, "w" to w, "h" to h)
+        }
+        c.sink.onFrame(info, slot, jpeg.size)
     }
 
     private suspend fun stills(c: Capture) {
@@ -262,7 +295,9 @@ object Engine {
         var failures = 0
         while (currentCoroutineIsActive()) {
             val jpeg = try {
-                transport.capture(c.board.host, c.request.maxLongSide)
+                Timing.timed("still.capture", "total_ms" to Timing.sinceNanos(c.startedNanos)) {
+                    transport.capture(c.board.host, c.request.maxLongSide)
+                }
             } catch (e: IOException) {
                 if (++failures > MAX_CONSECUTIVE_FAILURES) throw e
                 Log.w(TAG, "capture failed; retry $failures/$MAX_CONSECUTIVE_FAILURES", e)
@@ -280,8 +315,11 @@ object Engine {
                 ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { it.write(jpeg) }
             }
             try {
-                c.sink.onStill(info(c, FrameKind.STILL, w, h, 0), pipe[0])
-                writer.join()
+                val info = info(c, FrameKind.STILL, w, h, 0)
+                Timing.timed("still.handover", "t" to info.timestampMs, "bytes" to jpeg.size, "w" to w, "h" to h) {
+                    c.sink.onStill(info, pipe[0])
+                    writer.join()
+                }
             } finally {
                 writer.cancel()
                 pipe[0].close()
@@ -329,6 +367,7 @@ object Engine {
 
     private fun emit(c: Capture, state: String, detail: String) {
         c.state = state
+        Timing.mark("device.state", "state" to state, "detail" to detail.ifEmpty { null }, "total_ms" to Timing.sinceNanos(c.startedNanos))
         status.value = "${c.board.host}: $state $detail".trim()
         facts.value = facts.value.copy(
             state = state,
